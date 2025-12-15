@@ -104,12 +104,11 @@ class EAGLEDraftExtendCudaGraphRunner:
                         self.max_num_token,
                         (
                             self.model_runner.model_config.hf_config.target_hidden_size
-                            * 3
                             if hasattr(
                                 self.model_runner.model_config.hf_config,
                                 "target_hidden_size",
                             )
-                            else self.model_runner.model_config.hidden_size * 3
+                            else self.model_runner.model_config.hidden_size
                         ),
                     ),
                     dtype=self.model_runner.dtype,

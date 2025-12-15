@@ -16,7 +16,7 @@
 """Inference-only NemotronH model."""
 
 from collections.abc import Iterable
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import torch
 from torch import nn
@@ -542,6 +542,8 @@ class NemotronHModel(nn.Module):
         )
         self.norm_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
+        self.layers_to_capture = []
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -562,7 +564,10 @@ class NemotronHModel(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         residual = None
-        for layer in self.layers:
+        aux_hidden_states = []
+        for i, layer in enumerate(self.layers):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(hidden_states)
             if not isinstance(layer, Layers):
                 raise ValueError(f"Unknown layer type: {type(layer)}")
             hidden_states, residual = layer.forward(
@@ -576,7 +581,10 @@ class NemotronHModel(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm_f(hidden_states, residual)
-        return hidden_states
+
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+        return hidden_states, aux_hidden_states
 
 
 class NemotronHForCausalLM(nn.Module):
@@ -628,6 +636,8 @@ class NemotronHForCausalLM(nn.Module):
             )
         self.logits_processor = LogitsProcessor(config)
 
+        self.capture_aux_hidden_states = False
+
     def _init_model(
         self,
         config: NemotronHConfig,
@@ -653,8 +663,12 @@ class NemotronHForCausalLM(nn.Module):
         hidden_states = self.model.forward(
             input_ids, positions, forward_batch, pp_proxy_tensors, input_embeds
         )
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+        
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
 
     def copy_inputs_before_cuda_graphs(self, input_buffers, **kwargs):
@@ -662,6 +676,44 @@ class NemotronHForCausalLM(nn.Module):
 
     def get_seqlen_agnostic_capture_inputs(self, batch_size: int):
         return self.mamba_cache.get_seqlen_agnostic_capture_inputs(batch_size)
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def get_embed(self):
+        return self.model.embed_tokens.weight
+
+    def set_embed(self, embed):
+        # NOTE: If draft hidden size != target hidden size, the embed weight cannot be shared for EAGLE3
+        if (
+            hasattr(self.config, "target_hidden_size")
+            and self.config.target_hidden_size != self.config.hidden_size
+        ):
+            return
+        del self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = embed
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        self.capture_aux_hidden_states = False
+        # if layer_ids is None:
+        #     self.capture_aux_hidden_states = True
+        #     num_layers = self.config.num_hidden_layers
+        #     self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        # elif len(layer_ids) > 0:
+        #     self.capture_aux_hidden_states = True
+        #     # we plus 1 here because in sglang, for the ith layer, it takes the output
+        #     # of the (i-1)th layer as aux hidden state
+        #     self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         updated_weights = []

@@ -925,7 +925,7 @@ class EAGLEWorker(TpModelWorker):
             batch = batch.copy()
             batch.prepare_for_idle()
             hidden_size = (
-                self.model_config.hidden_size * 3
+                self.model_config.hidden_size
                 if self.speculative_algorithm.is_eagle3()
                 else self.model_config.hidden_size
             )

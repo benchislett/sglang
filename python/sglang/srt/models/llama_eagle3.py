@@ -132,11 +132,11 @@ class LlamaModel(nn.Module):
         else:
             self.hidden_size_in = config.hidden_size
 
-        self.fc = torch.nn.Linear(
-            self.hidden_size_in * 3,
-            config.hidden_size,
-            bias=getattr(config, "bias", False),
-        )
+        # self.fc = torch.nn.Linear(
+        #     self.hidden_size_in * 3,
+        #     config.hidden_size,
+        #     bias=getattr(config, "bias", False),
+        # )
 
         self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
 
@@ -223,7 +223,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         )  # draft logits processor has it's own vocab size
         self.logits_processor = LogitsProcessor(config_)
 
-        self.capture_aux_hidden_states = True
+        self.capture_aux_hidden_states = False
         self.hot_token_id = None
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
@@ -239,6 +239,8 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         ]
 
         for name, loaded_weight in weights:
+            if "layers.0." in name:
+                name = name.replace("layers.0.", "midlayer.")
             if "d2t" in name:
                 # d2t stores diffs between draft id and target id
                 self.hot_token_id = loaded_weight + torch.arange(loaded_weight.shape[0])
@@ -258,6 +260,8 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight, shard_id)
+                else:
+                    print(f"Warning: {param_name} not found in model parameters.")
                 break
             else:
                 # Handle regular parameters
@@ -268,6 +272,40 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+                else:
+                    print(f"Warning: {param_name} not found in model parameters.")
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> "LogitsProcessorOutput":
+        hidden_states, aux_hidden_states = self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+
+        if self.pp_group.is_last_rank:
+            if not get_embedding:
+                return self.logits_processor(
+                    input_ids,
+                    hidden_states,
+                    self.lm_head,
+                    forward_batch,
+                    aux_hidden_states,
+                )
+            else:
+                return self.pooler(hidden_states, forward_batch)
+        else:
+            return hidden_states
 
     def get_hot_token_id(self):
         return self.hot_token_id
